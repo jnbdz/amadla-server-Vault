@@ -1,0 +1,156 @@
+---
+- name: 'Vault | Provision Amadla Image'
+  hosts: all
+  any_errors_fatal: true # stop if anything is wrong
+  gather_facts: true
+  become: true # Means become `root` if set with true
+  become_user: root
+  become_method: sudo
+  vars:
+    user_username: "{{ lookup('env','USER_USERNAME') }}"
+    user_server_password: "{{ lookup('env','USER_SERVER_PASSWORD') }}"
+    vault_version: "1.0.1"
+  tasks:
+
+   # unzip vault_${VAULT_VERSION}_linux_amd64.zip
+   # sudo chown root:root vault
+   # sudo mv vault /usr/local/bin/
+
+    - name: Put SELinux in permissive mode, logging actions that would be blocked.
+      ansible.posix.selinux:
+        policy: targeted
+        state: permissive
+
+    # == `apt update`
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Intstall Vault required packages
+      apt:
+        pkg:
+        - unzip
+        - git
+        - ca-certificates
+        state: latest
+
+    # After updating and installing new packages you might have packages that are not useful anymore
+    # this will remove them
+    - name: Remove useless packages from the cache
+      apt:
+        autoclean: yes
+
+    - name: Download Vault
+      get_url:
+        url: "https://releases.hashicorp.com/vault/{{ vault_version }}/vault_{{ vault_version }}_linux_amd64.zip"
+        dest: /tmp/
+        checksum: sha256:https://releases.hashicorp.com/vault/{{ vault_version }}/vault_{{ vault_version }}_SHA256SUMS
+
+    - name: Unzip vault zip file
+      ansible.builtin.unarchive:
+        src: "/tmp/vault_{{ vault_version }}_linux_amd64.zip"
+        dest: /opt/vault
+        remote_src: yes
+
+    - name: Move vault application to the usr local bin
+      shell: 'mv vault /usr/local/bin/'
+      args:
+        executable: /bin/bash
+
+    #
+    # Prepare for systemd
+    #
+
+    - name: Adding the vault user
+      ansible.builtin.user:
+        name: vault
+        group: vault
+        shell: /bin/false
+        home: /etc/vault.d
+
+    - name: Make opt vault directory
+      ansible.builtin.file:
+        path: /opt/vault
+        state: directory
+        group: vault
+        owner: vault
+        recurse: yes
+
+    #
+    # Create general config
+    #
+
+    - name: Adding the /etc/systemd/system/vault.service
+      copy: src=config/vault.service dest="/etc/systemd/system/vault.service"
+
+    - name: Make vault etc directory
+      ansible.builtin.file:
+        path: /etc/vault
+        state: directory
+        group: vault
+        owner: vault
+        recurse: yes
+
+    - name: /etc/vault/vault_server.hcl
+      copy: src=config/vault_server.hcl dest="/etc/vault/vault_server.hcl" mode=640
+
+    #
+    # Create certs (main server only - self-signed only)
+    #
+
+    - name: Make the certs directory in the vault etc directory
+      ansible.builtin.file:
+        path: /etc/vault/certs
+        state: directory
+        group: vault
+        owner: vault
+        recurse: yes
+        mode: 750
+
+    - name: Copy vault_cert.cnf to /tmp
+      copy: src=config/vault_cert.cnf dest="/tmp/vault_cert.cnf"
+
+    - name: Creating certs
+      shell: 'openssl req -config /tmp/vault_cert.cnf -new -newkey rsa:4096 -x509 -sha256 -days 365 -nodes -out /etc/vault/certs/vault_cert.crt -keyout /etc/vault/certs/vault_cert.key'
+      args:
+        executable: /bin/bash
+
+    #
+    # Install auditd and the Log Analytics agent
+    #
+
+    - name: Make the vaut log directory
+      ansible.builtin.file:
+        path: /var/log/vault
+        state: directory
+        group: vault
+        owner: vault
+
+    - name: Enable vault audit
+      shell: 'vault audit enable file file_path=/var/log/vault/vault_audit.log'
+      args:
+        executable: /bin/bash
+
+    - name: Enable vault systemd service
+      ansible.builtin.systemd:
+        name: vault
+        enabled: yes
+        masked: no
+
+    - name: Start vault systemd service
+      ansible.builtin.systemd:
+        state: started
+        name: vault
+
+    # @TODO Should SELinux be activated before (then it's already done) or after?
+    # @TODO Check why when rebooting with cmd it didn't work but with the gui yes
+    # @NOTE: You need to reboot for SELinux enabling to take affect
+    - name: Activate SELinux
+      shell: selinux-activate
+      args:
+        executable: /bin/bash
+
+    - name: Enable SELinux
+      ansible.posix.selinux:
+        policy: targeted
+        state: enforcing
